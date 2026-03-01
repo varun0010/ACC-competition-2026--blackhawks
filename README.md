@@ -1,15 +1,32 @@
-# ACC Competition Documentation
+# ACC-competition-2026--blackhawks
+This repository contains codes for Quanser 2026 ACC Self Driving Car Competition - Blackhawks
 
-## Requirements
-Below are the files required to run the ACC agent effectively:
+## Instruction to run the code
 
-* Python 3.10+
-* Required packages listed in `requirements.txt`
+1) Make sure the pretrained YOLOv8 models (`best.pt` and `yolov8n.pt`) are downloaded and kept in the " code " folder  
+*(These are already included in this repository).*
+    
+2) To install all the required libraries:
+```
+python install.py
+```
+*(Alternatively, you can manually run `pip install -r requirements.txt`)*
 
-## Running Instructions
-1. Check the setup: Open a terminal inside this directory and run the `install.py` script.
-2. Launch the agent: Execute `IGNITE_CAR.bat` to launch the master agent on the QCar.
+3) To initialize the environment and launch the agent on the QCar:
+```
+IGNITE_CAR.bat
+```
+*(This batch file handles the environment setup and runs `Python code/acc_master_agent.py`)*
 
-## Models
-* `best.pt`: Specifically trained YOLOv8 model for traffic light detection. 
-* `yolov8n.pt`: Standard nano model for basic perception tasks.
+4) To test the different scenarios individually:
+```
+python code/scenario.py
+```
+
+5) To run the data collection module independently:
+```
+python code/acc_data_collector.py
+```
+
+## Track Details
+*   `code/camera_waypoints.csv` contains the navigation waypoints.
