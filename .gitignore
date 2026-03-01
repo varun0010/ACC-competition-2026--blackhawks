@@ -1,0 +1,15 @@
+logs/
+*.npz
+*.pt
+!best.pt
+!yolov8n.pt
+camera_snapshots/
+dataset_captures/
+dataset_collect/
+old weights/
+Studio/
+__pycache__/
+*.pyc
+.venv/
+qcar_agent/
+Quanzer_resources.txt
