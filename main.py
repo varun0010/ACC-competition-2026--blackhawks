@@ -1,19 +1,31 @@
 """
-Black Hawks — Master Controller  (Final Integration)
-=====================================================
+Black Hawks — ACC Master Controller  (Full Integration)
+========================================================
 Architecture:
   Layer 1 — PATH:   GPS + EKF + Stanley controller → global route following
   Layer 2 — LANE:   Dual-channel pipeline + EKF polynomial smoother → lane keeping
   Layer 3 — ML:     YOLOv8 every 5 frames — stop sign, pedestrian, crosswalk,
                     traffic lights (with red→green 10s immunity cooldown)
+                    FCW (Forward Collision Warning) via yolov8n.pt
   Layer 4 — BLEND:  Adaptive Stanley/Lane steer blend with conflict resolution
+  Layer 5 — TAXI:   State machine → QVL RGB body strip colour changes
 
 ML behaviour:
   • Stop sign      — right-half ROI, depth gate, 3-frame streak → stop 5s, cooldown 8s
-  • Pedestrian     — right-half ROI (same as stop sign), stop while visible, cooldown 5s
+  • Pedestrian     — right-half ROI, stop while visible, cooldown 5s
   • Crosswalk      — bottom-25% ROI, slow to 0.10 m/s while detected
   • Red/Yellow TL  — stop immediately (centre-biased TL selector)
   • Green TL       — clears stop sign/ped lock + 10s immunity (no re-stop on same light)
+  • FCW            — vehicle classes detected in frame → collision warning overlay
+
+Taxi scenario (QVL body strip):
+  MAGENTA_HUB  → waiting at hub
+  GREEN_TOPICK → heading to pickup
+  BLUE_PICK    → boarding (3 s hold)
+  GREEN_TODROP → heading to dropoff
+  ORANGE_DROP  → alighting (3 s hold)
+  GREEN_RETURN → returning to hub
+  MAGENTA_DONE → ride complete, stopped
 
 Steer blend (per-frame adaptive):
   • Lane + GPS OK     → 70% Stanley + 30% Lane
@@ -23,15 +35,15 @@ Steer blend (per-frame adaptive):
 
 Throttle hierarchy (highest priority first):
   1. ML STOP (red light / stop sign / pedestrian) → 0.0
-  2. Paused                                       → 0.0
-  3. Crosswalk detected                           → cap 0.032
-  4. Sharp curve (R < 25m)                        → cap 0.030
-  5. GPS corner >20 deg                           → cap 0.038
-  6. SpeedPID targeting V_REF
+  2. Taxi hold (boarding / alighting)             → 0.0
+  3. Paused / Done                                → 0.0
+  4. Crosswalk detected                           → cap 0.032
+  5. Sharp curve (R < 25m)                        → cap 0.030
+  6. GPS corner >20 deg                           → cap 0.038
+  7. SpeedPID targeting V_REF
 
 Controls: Q = quit    P = pause/resume
 Hardcoded: QCar2, csi[3]
-No QVL required.
 """
 
 from __future__ import annotations
@@ -73,73 +85,126 @@ try:
 except ImportError:
     print("YOLO not available.")
 
+TF_AVAILABLE = False
+try:
+    import keras
+    from PIL import Image
+    from model import TLClassifier, TSClassifier, crop_roi_image
+    TF_AVAILABLE = True
+    print("TF/Keras available.")
+except ImportError as e:
+    print(f"TF not available ({e}).")
+
 # =========================================================================
-# WAYPOINTS
+# QVL — RGB BODY STRIP
+# Tries QLabsQCar2 first, then QLabsQCar as fallback.
+# If QLabs not running → silently disabled, car still drives.
+# =========================================================================
+_strip_actor = None
+_qlabs_conn  = None
+
+COL_MAGENTA = [1.0, 0.0, 1.0]
+COL_GREEN   = [0.0, 1.0, 0.0]
+COL_BLUE    = [0.0, 0.0, 1.0]
+COL_ORANGE  = [1.0, 0.50, 0.0]
+COL_WHITE   = [1.0, 1.0, 1.0]
+
+def _qvl_connect():
+    global _strip_actor, _qlabs_conn
+    QCarClass = None
+    try:
+        from qvl.qcar2 import QLabsQCar2
+        QCarClass = QLabsQCar2
+        print("[STRIP] Using qvl.qcar2.QLabsQCar2")
+    except ImportError:
+        pass
+    if QCarClass is None:
+        try:
+            from qvl.qcar import QLabsQCar
+            QCarClass = QLabsQCar
+            print("[STRIP] Using qvl.qcar.QLabsQCar (fallback)")
+        except ImportError:
+            print("[STRIP] QVL not installed — body strip disabled.")
+            return
+    try:
+        from qvl.qlabs import QuanserInteractiveLabs
+        ql = QuanserInteractiveLabs()
+        if not ql.open("localhost"):
+            print("[STRIP] QLabs not reachable — body strip disabled.")
+            return
+        actor = QCarClass(ql)
+        actor.actorNumber = 0
+        _qlabs_conn  = ql
+        _strip_actor = actor
+        print("[STRIP] Connected — body strip active.")
+    except Exception as e:
+        print(f"[STRIP] Connection error: {e} — body strip disabled.")
+
+def _set_strip(colour):
+    if _strip_actor is None:
+        return
+    try:
+        _strip_actor.set_led_strip_uniform(color=colour)
+    except Exception:
+        pass
+
+def _qvl_close():
+    if _qlabs_conn is not None:
+        try: _qlabs_conn.close()
+        except: pass
+
+# =========================================================================
+# WAYPOINTS  — updated from recorded GPS data (ACC competition route)
 # =========================================================================
 INITIAL_POSE = [-1.205, -0.830, math.radians(-44.7)]
 
+# Updated waypoints from recorded GPS telemetry (WP0000–WP0179)
 WAYPOINTS_XY = [
-    (-0.716900, -1.122700),(-0.592100, -1.140700),(-0.441700, -1.139600),
-    (-0.269300, -1.124400),(-0.111600, -1.111900),(+0.054300, -1.110900),
-    (+0.216100, -1.116500),(+0.375100, -1.124300),(+0.433800, -1.125000),
-    (+0.584700, -1.130200),(+0.749500, -1.133100),(+0.930800, -1.132700),
-    (+1.079400, -1.126700),(+1.243700, -1.097400),(+1.299200, -1.083500),
-    (+1.449600, -1.029500),(+1.601000, -0.963600),(+1.757200, -0.885200),
-    (+1.873400, -0.808900),(+2.018400, -0.658500),(+2.092000, -0.540000),
-    (+2.120000, -0.490000),(+2.159200, -0.350900),(+2.185900, -0.199200),
-    (+2.206700, -0.041600),(+2.224100, +0.131400),(+2.227800, +0.184200),
-    (+2.238700, +0.366600),(+2.245300, +0.536400),(+2.244500, +0.586200),
-    (+2.247200, +0.768300),(+2.248400, +0.963300),(+2.249400, +1.132100),
-    (+2.250200, +1.294900),(+2.250300, +1.470000),(+2.248200, +1.519900),
-    (+2.249400, +1.706200),(+2.249900, +1.891500),(+2.250100, +2.054800),
-    (+2.249400, +2.107800),(+2.248000, +2.279700),(+2.245200, +2.458900),
-    (+2.242000, +2.630300),(+2.240800, +2.683800),(+2.237100, +2.870800),
-    (+2.233700, +3.035300),(+2.229900, +3.213000),(+2.225900, +3.384000),
-    (+2.220200, +3.559400),(+2.205300, +3.716900),(+2.173600, +3.868500),
-    (+2.127300, +3.995700),(+2.058900, +4.116300),(+1.942200, +4.242300),
-    (+1.834800, +4.327900),(+1.715700, +4.392300),(+1.590100, +4.437100),
-    (+1.462000, +4.459100),(+1.330800, +4.460400),(+1.183500, +4.451600),
-    (+1.022500, +4.439200),(+0.958900, +4.430600),(+0.805300, +4.421300),
-    (+0.644900, +4.416000),(+0.479300, +4.414300),(+0.303300, +4.414500),
-    (+0.251200, +4.411000),(+0.077400, +4.413600),(-0.112700, +4.415300),
-    (-0.288800, +4.417400),(-0.342600, +4.414700),(-0.519300, +4.417900),
-    (-0.688300, +4.420000),(-0.857900, +4.420000),(-1.014200, +4.409200),
-    (-1.149300, +4.380700),(-1.289300, +4.323100),(-1.334400, +4.303500),
-    (-1.503900, +4.201700),(-1.619600, +4.123900),(-1.734800, +4.025500),
-    (-1.815400, +3.930600),(-1.905200, +3.769900),(-1.948200, +3.644500),
-    (-1.965000, +3.515800),(-1.971000, +3.351400),(-1.971100, +3.184100),
-    (-1.968600, +3.137500),(-1.964800, +2.949000),(-1.960900, +2.778600),
-    (-1.956200, +2.598600),(-1.953000, +2.549000),(-1.947700, +2.360500),
-    (-1.943100, +2.198100),(-1.937900, +2.149300),(-1.933200, +1.961400),
-    (-1.927800, +1.772600),(-1.918600, +1.594100),(-1.900200, +1.448500),
-    (-1.855300, +1.289300),(-1.771400, +1.131600),(-1.688500, +1.025200),
-    (-1.590800, +0.936700),(-1.460300, +0.851700),(-1.297000, +0.793000),
-    (-1.176300, +0.768700),(-1.038300, +0.764300),(-0.981000, +0.765700),
-    (-0.832000, +0.778100),(-0.667800, +0.793700),(-0.505400, +0.809000),
-    (-0.452700, +0.817500),(-0.257500, +0.833300),(-0.095800, +0.844500),
-    (+0.073400, +0.853900),(+0.249400, +0.862600),(+0.298700, +0.867800),
-    (+0.481600, +0.875600),(+0.667800, +0.882300),(+0.818700, +0.882200),
-    (+0.872300, +0.883400),(+1.062400, +0.872200),(+1.313400, +0.846300),
-    (+1.459600, +0.812200),(+1.574000, +0.769300),(+1.694100, +0.696200),
-    (+1.797200, +0.610400),(+1.896300, +0.487300),(+1.963900, +0.365500),
-    (+2.007900, +0.229500),(+2.025000, +0.122800),(+2.019100, -0.044200),
-    (+1.989700, -0.177400),(+1.943100, -0.290200),(+1.860600, -0.427400),
-    (+1.763000, -0.563600),(+1.665400, -0.671800),(+1.622200, -0.709900),
-    (+1.421700, -0.835800),(+1.286200, -0.880300),(+1.150400, -0.896000),
-    (+1.104000, -0.897000),(+0.911000, -0.874000),(+0.772600, -0.843100),
-    (+0.567900, -0.756900),(+0.458300, -0.681600),(+0.365400, -0.593300),
-    (+0.279000, -0.476100),(+0.217600, -0.357200),(+0.172500, -0.212700),
-    (+0.156300, -0.099200),(+0.155200, +0.040200),(+0.161600, +0.211000),
-    (+0.161700, +0.346100),(+0.147700, +0.488200),(+0.080400, +0.667700),
-    (+0.021900, +0.774800),(-0.060700, +0.882100),(-0.170100, +0.981100),
-    (-0.283900, +1.056400),(-0.419400, +1.115800),(-0.596600, +1.148600),
-    (-0.724900, +1.151600),(-0.857000, +1.129300),(-0.986000, +1.087100),
-    (-1.108800, +1.020800),(-1.222800, +0.926100),(-1.307700, +0.824400),
-    (-1.338100, +0.779800),(-1.409500, +0.638400),(-1.478400, +0.461100),
-    (-1.524000, +0.316000),(-1.549200, +0.183600),(-1.554200, +0.047800),
-    (-1.545400, -0.112900),(-1.525400, -0.287600),(-1.513200, -0.347000),
-    (-1.450300, -0.577900),(-1.384500, -0.701200),(-1.352100, -0.748600),
-    (-1.270800, -0.841700),(-1.255700, -0.861500),
+    (-0.9655, -0.9479), (-0.8505, -0.9897), (-0.7304, -1.0186), (-0.7769, -1.0107),
+    (-0.5763, -1.0408), (-0.3557, -1.0609), (-0.1552, -1.0726), (+0.0405, -1.0790),
+    (+0.2143, -1.0824), (+0.3812, -1.0845), (+0.4395, -1.0833), (+0.6134, -1.0839),
+    (+0.7781, -1.0848), (+0.9457, -1.0836), (+1.1145, -1.0779), (+1.2429, -1.0617),
+    (+1.3851, -1.0273), (+1.5415, -0.9799), (+1.6862, -0.9244), (+1.8178, -0.8543),
+    (+1.9127, -0.7835), (+2.0183, -0.6710), (+2.1109, -0.5056), (+2.1522, -0.3840),
+    (+2.1691, -0.3221), (+2.1927, -0.1776), (+2.2069, -0.0370), (+2.2152, +0.1289),
+    (+2.2195, +0.2989), (+2.2216, +0.4517), (+2.2231, +0.6178), (+2.2197, +0.6780),
+    (+2.2216, +0.8304), (+2.2241, +1.0009), (+2.2254, +1.1790), (+2.2223, +1.2287),
+    (+2.2255, +1.4090), (+2.2277, +1.5920), (+2.2293, +1.7752), (+2.2282, +1.8321),
+    (+2.2301, +2.0074), (+2.2315, +2.1771), (+2.2326, +2.3497), (+2.2330, +2.4070),
+    (+2.2341, +2.5859), (+2.2350, +2.7656), (+2.2360, +2.9490), (+2.2362, +2.9988),
+    (+2.2371, +3.1885), (+2.2367, +3.3934), (+2.2298, +3.5480), (+2.2098, +3.6700),
+    (+2.1658, +3.8072), (+2.0999, +3.9642), (+1.9945, +4.1320), (+1.9062, +4.2293),
+    (+1.7965, +4.3157), (+1.6860, +4.3765), (+1.5657, +4.4174), (+1.4271, +4.4386),
+    (+1.2791, +4.4379), (+1.1200, +4.4269), (+1.0561, +4.4203), (+0.8901, +4.4032),
+    (+0.7540, +4.3939), (+0.6034, +4.3924), (+0.4287, +4.3946), (+0.2484, +4.3976),
+    (+0.1990, +4.3951), (+0.0274, +4.3989), (-0.1540, +4.4029), (-0.3378, +4.4066),
+    (-0.3919, +4.4045), (-0.5740, +4.4090), (-0.7553, +4.4123), (-0.9178, +4.4119),
+    (-1.0782, +4.3998), (-1.2263, +4.3632), (-1.3427, +4.3157), (-1.4571, +4.2412),
+    (-1.5825, +4.1414), (-1.7003, +4.0318), (-1.7895, +3.9272), (-1.8681, +3.8035),
+    (-1.9159, +3.6916), (-1.9432, +3.5733), (-1.9614, +3.4105), (-1.9669, +3.2814),
+    (-1.9550, +3.1451), (-1.9206, +3.0043), (-1.8717, +2.8593), (-1.8078, +2.6939),
+    (-1.7472, +2.5386), (-1.7012, +2.3988), (-1.6782, +2.2778), (-1.6755, +2.1317),
+    (-1.6833, +1.9804), (-1.6837, +1.9304), (-1.6993, +1.7261), (-1.7071, +1.5937),
+    (-1.6986, +1.4467), (-1.6597, +1.2841), (-1.5727, +1.1095), (-1.4825, +0.9983),
+    (-1.3678, +0.9013), (-1.2574, +0.8372), (-1.1154, +0.7885), (-1.0648, +0.7728),
+    (-0.9103, +0.7664), (-0.7521, +0.7703), (-0.5969, +0.7788), (-0.4173, +0.7903),
+    (-0.3640, +0.7967), (-0.1819, +0.8067), (-0.0066, +0.8144), (+0.1669, +0.8203),
+    (+0.2165, +0.8250), (+0.4029, +0.8279), (+0.5816, +0.8280), (+0.7579, +0.8266),
+    (+0.8150, +0.8301), (+1.0858, +0.8197), (+1.2137, +0.8044), (+1.3612, +0.7702),
+    (+1.4963, +0.7286), (+1.6381, +0.6661), (+1.7597, +0.5891), (+1.8611, +0.5010),
+    (+1.9470, +0.3865), (+2.0143, +0.2618), (+2.0465, +0.1584), (+2.0637, -0.0060),
+    (+2.0582, -0.1279), (+2.0241, -0.2743), (+1.9392, -0.4496), (+1.8614, -0.5543),
+    (+1.7600, -0.6513), (+1.6629, -0.7189), (+1.5290, -0.7788), (+1.3910, -0.8149),
+    (+1.2446, -0.8195), (+1.1906, -0.8155), (+1.0397, -0.7820), (+0.8569, -0.7201),
+    (+0.7157, -0.6631), (+0.5851, -0.5938), (+0.4578, -0.4953), (+0.3636, -0.3917),
+    (+0.2975, -0.2895), (+0.2477, -0.1672), (+0.2097, -0.0106), (+0.1797, +0.1616),
+    (+0.1529, +0.2896), (+0.1027, +0.4402), (+0.0422, +0.5547), (-0.0554, +0.6805),
+    (-0.1518, +0.7861), (-0.2708, +0.8853), (-0.3981, +0.9646), (-0.5223, +1.0098),
+    (-0.5742, +1.0308), (-0.7358, +1.0566), (-0.8932, +1.0672), (-1.0697, +1.0547),
+    (-1.1940, +1.0275), (-1.3380, +0.9662), (-1.4993, +0.8507), (-1.5380, +0.8146),
+    (-1.6533, +0.6711), (-1.7279, +0.5603), (-1.7913, +0.4259), (-1.8326, +0.2560),
+    (-1.8396, +0.1079), (-1.8153, -0.0393), (-1.7702, -0.1680), (-1.7047, -0.2778),
+    (-1.6119, -0.3929), (-1.4887, -0.5240), (-1.4549, -0.5563), (-1.3706, -0.6412),
 ]
 WP   = np.array(WAYPOINTS_XY, dtype=np.float64)
 N_WP = len(WP)
@@ -227,8 +292,8 @@ YOLO_FRAME_SKIP       = 5
 YOLO_CONF             = 0.45
 
 # Stop sign
-STOP_DEPTH_MAX        = 2.0      # metres
-STOP_AREA_FALLBACK    = 3000     # px² when no depth sensor
+STOP_DEPTH_MAX        = 2.0
+STOP_AREA_FALLBACK    = 3000
 STOP_MIN_CONF         = 0.60
 STOP_STREAK_REQ       = 3
 STOP_HOLD_S           = 5.0
@@ -237,41 +302,133 @@ STOP_COOLDOWN_S       = 8.0
 # Traffic light
 TL_MIN_CONF           = 0.50
 TL_MIN_AREA           = 300
-TL_RIGHT_EXCL         = 0.80     # ignore TL detections right of this fraction
-TL_GREEN_AFTER_RED_COOLDOWN = 10.0   # seconds to ignore ALL red lights after a red→green cycle
+TL_RIGHT_EXCL         = 0.80
+TL_GREEN_AFTER_RED_COOLDOWN = 10.0
 
 # ── Pedestrian detection ──────────────────────────────────────────────────
-# ROI: right half of frame, full height (mirrors stop sign side)
-PED_ROI_X1_FRAC       = 0.50    # left edge of pedestrian ROI (right half of frame)
+PED_ROI_X1_FRAC       = 0.50
 PED_ROI_X2_FRAC       = 1.00
 PED_ROI_Y1_FRAC       = 0.00
 PED_ROI_Y2_FRAC       = 1.00
 PED_MIN_CONF          = 0.50
-PED_MIN_AREA          = 800      # px² — ignore tiny distant blobs
-PED_STOP_HOLD_S       = 3.0      # hold stop while pedestrian visible
+PED_MIN_AREA          = 800
+PED_STOP_HOLD_S       = 3.0
 PED_COOLDOWN_S        = 5.0
 
 # ── Crosswalk ─────────────────────────────────────────────────────────────
-# ROI: full width, bottom 25% of frame only
 CW_ROI_X1_FRAC        = 0.00
 CW_ROI_X2_FRAC        = 1.00
-CW_ROI_Y1_FRAC        = 0.75    # bottom quarter
+CW_ROI_Y1_FRAC        = 0.75
 CW_ROI_Y2_FRAC        = 1.00
 CW_MIN_CONF           = 0.45
 CW_MIN_AREA           = 500
-CW_SLOW_SPEED         = 0.10    # m/s target while crosswalk visible
-CW_SLOW_THROTTLE_CAP  = 0.032   # hard throttle cap during crosswalk
+CW_SLOW_SPEED         = 0.10
+CW_SLOW_THROTTLE_CAP  = 0.032
 
-# Encoder (dead-reckoning between GPS fixes)
+# ── FCW (Forward Collision Warning) ───────────────────────────────────────
+ENABLE_FCW            = True
+FCW_CONFIDENCE        = 0.40
+COLLISION_DIST_FRAC   = 0.70
+VEHICLE_CLASSES       = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+
+# ── Encoder (dead-reckoning between GPS fixes) ────────────────────────────
 METRES_PER_TICK       = 5.11e-7
 ENCODER_OVERFLOW      = 2**31 - 1
 GYRO_BIAS             = 0.003243
 GYRO_NOISE_FLOOR      = 0.02
 
-# Map display
+# ── Map display ───────────────────────────────────────────────────────────
 MAP_W = MAP_H = 500
 WORLD_XMIN, WORLD_XMAX = -3.0, 3.5
 WORLD_YMIN, WORLD_YMAX = -2.0, 5.5
+
+# =========================================================================
+# TAXI SCENARIO (state machine + QVL strip colours)
+# =========================================================================
+TAXI_HUB_LEAVE  = np.array([-0.037, -1.039])
+TAXI_PICKUP     = np.array([ 0.125,  4.395])
+TAXI_DROPOFF    = np.array([-0.905,  0.800])
+TAXI_HUB_ENTER  = np.array([-1.804,  0.067])
+TAXI_STOP_RADIUS = 0.30
+TAXI_HOLD_S      = 3.0
+TAXI_LEAVE_RADIUS = 0.50
+
+S_MAGENTA_HUB   = 'MAGENTA_HUB'
+S_GREEN_TOPICK  = 'GREEN_TOPICK'
+S_BLUE_PICK     = 'BLUE_PICK'
+S_GREEN_TODROP  = 'GREEN_TODROP'
+S_ORANGE_DROP   = 'ORANGE_DROP'
+S_GREEN_RETURN  = 'GREEN_RETURN'
+S_MAGENTA_DONE  = 'MAGENTA_DONE'
+
+_STATE_COLOUR = {
+    S_MAGENTA_HUB:  COL_MAGENTA,
+    S_GREEN_TOPICK: COL_GREEN,
+    S_BLUE_PICK:    COL_BLUE,
+    S_GREEN_TODROP: COL_GREEN,
+    S_ORANGE_DROP:  COL_ORANGE,
+    S_GREEN_RETURN: COL_GREEN,
+    S_MAGENTA_DONE: COL_MAGENTA,
+}
+
+class TaxiScenario:
+    def __init__(self):
+        self.state      = S_MAGENTA_HUB
+        self.hold_timer = 0.0
+        self._prev      = None
+        self._apply()
+        print(f"[TAXI] State={self.state}")
+
+    def _apply(self):
+        if self.state == self._prev:
+            return
+        self._prev = self.state
+        _set_strip(_STATE_COLOUR.get(self.state, COL_MAGENTA))
+        print(f"[TAXI] Strip → {self.state}")
+
+    def update(self, pos: np.ndarray, dt: float) -> Tuple[bool, str]:
+        """Returns (force_stop, label_string)."""
+        force_stop = False
+        p = np.array([float(pos[0]), float(pos[1])])
+
+        if self.state == S_MAGENTA_HUB:
+            if np.linalg.norm(p - TAXI_HUB_LEAVE) < TAXI_LEAVE_RADIUS:
+                self.state = S_GREEN_TOPICK
+
+        elif self.state == S_GREEN_TOPICK:
+            if np.linalg.norm(p - TAXI_PICKUP) < TAXI_STOP_RADIUS:
+                self.state      = S_BLUE_PICK
+                self.hold_timer = TAXI_HOLD_S
+
+        elif self.state == S_BLUE_PICK:
+            force_stop       = True
+            self.hold_timer -= dt
+            if self.hold_timer <= 0.0:
+                self.state = S_GREEN_TODROP
+
+        elif self.state == S_GREEN_TODROP:
+            if np.linalg.norm(p - TAXI_DROPOFF) < TAXI_STOP_RADIUS:
+                self.state      = S_ORANGE_DROP
+                self.hold_timer = TAXI_HOLD_S
+
+        elif self.state == S_ORANGE_DROP:
+            force_stop       = True
+            self.hold_timer -= dt
+            if self.hold_timer <= 0.0:
+                self.state = S_GREEN_RETURN
+
+        elif self.state == S_GREEN_RETURN:
+            if np.linalg.norm(p - TAXI_HUB_ENTER) < TAXI_STOP_RADIUS:
+                self.state = S_MAGENTA_DONE
+
+        elif self.state == S_MAGENTA_DONE:
+            force_stop = True
+
+        self._apply()
+        lbl = f"TAXI:{self.state}"
+        if force_stop and self.hold_timer > 0:
+            lbl += f" {self.hold_timer:.1f}s"
+        return force_stop, lbl
 
 # =========================================================================
 # HELPERS
@@ -290,7 +447,6 @@ def eval_poly(c: np.ndarray, y) -> np.ndarray:
 def box_in_roi(x1: int, y1: int, x2: int, y2: int,
                fw: int, fh: int,
                x1f: float, y1f: float, x2f: float, y2f: float) -> bool:
-    """Return True if box centre falls inside the fractional ROI."""
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
     return (fw*x1f <= cx <= fw*x2f) and (fh*y1f <= cy <= fh*y2f)
@@ -298,7 +454,6 @@ def box_in_roi(x1: int, y1: int, x2: int, y2: int,
 def draw_roi_outline(frame: np.ndarray,
                      x1f: float, y1f: float, x2f: float, y2f: float,
                      color: Tuple[int,int,int], label: str = "") -> None:
-    """Draw a dashed-style ROI rectangle with optional label on frame."""
     h, w = frame.shape[:2]
     rx1, ry1 = int(w*x1f), int(h*y1f)
     rx2, ry2 = int(w*x2f), int(h*y2f)
@@ -442,15 +597,15 @@ class PolyEKF:
 
 
 # =========================================================================
-# LAYER 2 — LANE LINE STATE
+# LAYER 2 — LANE LINE STATE  (EKF-smoothed polynomial)
 # =========================================================================
 class LaneLine:
     MAX_LOST = 8
 
     def __init__(self):
-        self.ekf        = PolyEKF()
-        self.detected   = False
-        self.best_fit   : Optional[np.ndarray] = None
+        self.ekf         = PolyEKF()
+        self.detected    = False
+        self.best_fit    : Optional[np.ndarray] = None
         self.frames_lost = 0
 
     def update(self, raw: np.ndarray):
@@ -468,8 +623,8 @@ class LaneLine:
         return self.best_fit
 
     def reset(self):
-        self.ekf.reset(); self.detected=False
-        self.best_fit=None; self.frames_lost=0
+        self.ekf.reset(); self.detected = False
+        self.best_fit = None; self.frames_lost = 0
 
 
 # =========================================================================
@@ -580,15 +735,12 @@ def curvature(coeffs: np.ndarray, bh: int) -> Tuple[float, str]:
 
 
 # =========================================================================
-# LAYER 2 — LANE PIPELINE (returns steer error + annotated frame)
+# LAYER 2 — LANE PIPELINE
 # =========================================================================
 def run_lane_pipeline(frame: np.ndarray,
                       left_lane: LaneLine,
                       right_lane: LaneLine
                       ) -> Tuple[float, float, str, np.ndarray, str]:
-    """
-    Returns: (steer_error [-1,1], curve_radius, curve_dir, ann_frame, mode_str)
-    """
     h, w  = frame.shape[:2]
     ploty = np.linspace(0, h-1, h)
 
@@ -603,7 +755,6 @@ def run_lane_pipeline(frame: np.ndarray,
 
     mask_y, mask_w, comb = build_masks(warped)
 
-    # Peak initialisation with EKF warm-start
     lf_p = left_lane.get_fit()
     rf_p = right_lane.get_fit()
     y_pk = (int(np.clip(eval_poly(lf_p, h-1), 0, w-1))
@@ -613,21 +764,19 @@ def run_lane_pipeline(frame: np.ndarray,
 
     lpx, lpy = sliding_window(mask_y, y_pk, lf_p)
     rpx, rpy = sliding_window(mask_w, w_pk, rf_p)
-    if len(rpx) < MIN_FIT_PIXELS:           # gradient fallback for right
+    if len(rpx) < MIN_FIT_PIXELS:
         rpx2, rpy2 = sliding_window(comb, w_pk, rf_p)
         if len(rpx2) > len(rpx): rpx, rpy = rpx2, rpy2
 
     lf = fit_ekf(lpx, lpy, left_lane,  h)
     rf = fit_ekf(rpx, rpy, right_lane, h)
 
-    # Lane-width sanity gate
     if lf is not None and rf is not None:
         width = eval_poly(rf, h-1) - eval_poly(lf, h-1)
         if not (MIN_LANE_WIDTH_PX < width < MAX_LANE_WIDTH_PX):
             if len(lpx) >= len(rpx): right_lane.reset(); rf = None
             else:                     left_lane.reset();  lf = None
 
-    # Centre calculation
     if lf is not None and rf is not None:
         centre_x = (eval_poly(lf,h-1) + eval_poly(rf,h-1)) / 2.0
         lx_arr   = eval_poly(lf, ploty);  rx_arr = eval_poly(rf, ploty)
@@ -652,7 +801,6 @@ def run_lane_pipeline(frame: np.ndarray,
     dev_px     = (w/2.0) - centre_x
     steer_err  = float(np.clip(dev_px / HALF_LANE_PX, -1.0, 1.0))
 
-    # ── Annotation ────────────────────────────────────────────────────────
     ann = frame.copy()
     try:
         wz = np.zeros((h, w, 3), dtype=np.uint8)
@@ -664,19 +812,17 @@ def run_lane_pipeline(frame: np.ndarray,
             cv2.polylines(wz,
                 [np.array([np.transpose(np.vstack([lx_arr.clip(0,w-1),ploty]))],dtype=np.int32)],
                 False,(0,200,255),4)
-        ca   = np.full_like(ploty, centre_x)
+        ca = np.full_like(ploty, centre_x)
         cv2.polylines(wz,
             [np.array([np.transpose(np.vstack([ca.clip(0,w-1),ploty]))],dtype=np.int32)],
             False,(0,255,255),3)
-        uw   = cv2.warpPerspective(wz, Minv, (w, h))
-        ann  = cv2.addWeighted(ann, 1.0, uw, 0.38, 0)
+        uw  = cv2.warpPerspective(wz, Minv, (w, h))
+        ann = cv2.addWeighted(ann, 1.0, uw, 0.38, 0)
     except Exception: pass
 
-    # ROI outline
     try: cv2.polylines(ann,[roi_pts.reshape(1,-1,2)],True,(0,220,80),2)
     except Exception: pass
 
-    # LDW
     if abs(dev_px) > LDW_THRESH:
         sd = "RIGHT" if dev_px > 0 else "LEFT"
         cv2.rectangle(ann,(10,85),(480,140),(0,0,100),-1)
@@ -704,7 +850,7 @@ class DepthSensor:
         except Exception as e:
             print(f"RealSense init failed: {e}")
 
-    def depth_in_box(self, x1,y1,x2,y2) -> Optional[float]:
+    def depth_in_box(self, x1, y1, x2, y2) -> Optional[float]:
         if not self.ok or self.rs is None: return None
         try:
             self.rs.read_depth()
@@ -720,7 +866,6 @@ class DepthSensor:
 # LAYER 3 — TRAFFIC LIGHT SELECTOR
 # =========================================================================
 def select_tl(detections: List[dict], fw: int) -> Optional[str]:
-    """Centre-biased: exclude rightmost, pick closest to frame centre."""
     cands = [d for d in detections
              if d['cx'] < fw*TL_RIGHT_EXCL
              and d['area'] >= TL_MIN_AREA
@@ -750,11 +895,13 @@ def make_map() -> np.ndarray:
 # =========================================================================
 _car_ref = None
 KILL     = False
-def _stop(sig=None,_=None):
+_LEDS_OFF = np.zeros(8, dtype=int)
+
+def _stop(sig=None, _=None):
     global KILL, _car_ref
     KILL = True
     if _car_ref:
-        try: _car_ref.write(0.0, 0.0, np.zeros(8,dtype=int))
+        try: _car_ref.write(0.0, 0.0, _LEDS_OFF)
         except: pass
 signal.signal(signal.SIGINT,  _stop)
 signal.signal(signal.SIGTERM, _stop)
@@ -766,18 +913,29 @@ signal.signal(signal.SIGTERM, _stop)
 def main():
     global _car_ref, KILL
 
-    print("\n  Black Hawks — Master Controller")
+    print("\n  Black Hawks — ACC Master Controller")
     print(f"  {N_WP} waypoints   QCar2   csi[{FRONT_CSI_IDX}]")
     print("  Q=quit   P=pause/resume\n")
 
-    # ── YOLO + depth ──────────────────────────────────────────────────────
-    yolo_model = None
+    # ── QVL body strip ───────────────────────────────────────────────────
+    _qvl_connect()
+
+    # ── YOLO + FCW + depth ────────────────────────────────────────────────
+    yolo_model  = None
+    fcw_detector = None
     if YOLO_AVAILABLE:
-        try:
-            yolo_model = YOLO('best.pt')
-            print(f"  YOLO: {list(yolo_model.names.values())}")
-        except Exception as e:
-            print(f"  YOLO load failed: {e}")
+        for name, attr in [('best.pt', 'yolo'), ('yolov8n.pt', 'fcw')]:
+            try:
+                m = YOLO(name)
+                if attr == 'yolo':
+                    yolo_model = m
+                    print(f"  YOLO: {list(yolo_model.names.values())}")
+                else:
+                    fcw_detector = m
+                    print(f"  FCW detector: {name} loaded")
+            except Exception as e:
+                print(f"  {name} load failed: {e}")
+
     depth_sensor = DepthSensor()
 
     # ── Controllers ───────────────────────────────────────────────────────
@@ -786,6 +944,7 @@ def main():
     stanley    = Stanley()
     left_lane  = LaneLine()
     right_lane = LaneLine()
+    taxi       = TaxiScenario()
 
     # ── State ─────────────────────────────────────────────────────────────
     prev_enc          = None
@@ -808,7 +967,7 @@ def main():
     green_active      = False
     ml_brake          = False
     ml_status         = "PATH CLEAR"
-    ml_color          = (0,255,0)
+    ml_color          = (0, 255, 0)
 
     # Pedestrian state
     ped_active        = False
@@ -816,20 +975,20 @@ def main():
     ped_cooldown_end  = 0.0
 
     # Crosswalk state
-    cw_detected       = False   # refreshed every YOLO frame
+    cw_detected       = False
 
-    # Traffic light: red→green immunity (10 s after a completed red→green cycle)
-    tl_immunity_end   = 0.0     # time until TL red is ignored
+    # TL immunity
+    tl_immunity_end   = 0.0
 
-    # Persistent bounding boxes for display (updated every YOLO frame, shown every frame)
-    yolo_boxes: List[dict] = []   # list of {x1,y1,x2,y2,label,color,conf}
+    # Persistent bounding boxes (updated every YOLO frame, drawn every frame)
+    yolo_boxes: List[dict] = []
 
     base_map  = make_map()
-    traj_map  = np.zeros((MAP_H,MAP_W,3), dtype=np.uint8)
+    traj_map  = np.zeros((MAP_H, MAP_W, 3), dtype=np.uint8)
 
     with QCar(readMode=0) as car, \
-         QCarCameras(enableFront=True,enableBack=True,
-                     enableLeft=True,enableRight=True) as cams, \
+         QCarCameras(enableFront=True, enableBack=True,
+                     enableLeft=True, enableRight=True) as cams, \
          QCarGPS(initialPose=INITIAL_POSE) as gps:
 
         _car_ref = car
@@ -892,17 +1051,22 @@ def main():
                 v_ref = (V_REF_SLOW if corner_deg > CORNER_THRESH or
                          dist_next < SLOW_RADIUS else V_REF)
 
+                # ── Taxi state machine ────────────────────────────────────
+                taxi_stop, taxi_label = taxi.update(np.array([ex, ey]), dt)
+
                 # ══════════════════════════════════════════════════════════
                 # LAYER 3 — ML PERCEPTION (every YOLO_FRAME_SKIP frames)
                 # ══════════════════════════════════════════════════════════
-                csi = cams.csi[FRONT_CSI_IDX]
+                csi       = cams.csi[FRONT_CSI_IDX]
                 frame_raw = None
                 if csi is not None and csi.imageData is not None:
                     frame_raw = cv2.resize(csi.imageData.copy(), (FRAME_W, FRAME_H))
 
                 yolo_frame_ctr += 1
-                if yolo_model is not None and frame_raw is not None and \
-                        (yolo_frame_ctr % YOLO_FRAME_SKIP == 0):
+                run_yolo = (yolo_model is not None and frame_raw is not None and
+                            yolo_frame_ctr % YOLO_FRAME_SKIP == 0)
+
+                if run_yolo:
                     try:
                         res          = yolo_model.predict(source=frame_raw,
                                                           conf=YOLO_CONF, verbose=False)
@@ -912,7 +1076,7 @@ def main():
                         ped_raw      = False
                         cw_raw       = False
                         tl_dets: List[dict] = []
-                        yolo_boxes   = []   # reset draw list each YOLO frame
+                        yolo_boxes   = []
 
                         for r in res:
                             for box in r.boxes:
@@ -929,8 +1093,7 @@ def main():
                                     tl_col = ((0,0,255) if key=='red' else
                                               (0,200,255) if key=='yellow' else (0,255,0))
                                     tl_dets.append({'label':key,'cx':cx,'cy':cy,
-                                                    'area':area,'conf':conf,
-                                                    'box':(x1,y1,x2,y2)})
+                                                    'area':area,'conf':conf})
                                     yolo_boxes.append({'x1':x1,'y1':y1,'x2':x2,'y2':y2,
                                                        'label':f"TL:{key} {conf:.2f}",
                                                        'color':tl_col})
@@ -962,7 +1125,7 @@ def main():
                                                        'color':(0,165,255)})
 
                                 # ── Crosswalk (bottom-25% ROI) ────────────
-                                elif 'crosswalk' in lbl or 'cross' in lbl or 'zebra' in lbl:
+                                elif any(k in lbl for k in ('crosswalk','cross','zebra')):
                                     if conf >= CW_MIN_CONF and area >= CW_MIN_AREA:
                                         in_roi = box_in_roi(x1,y1,x2,y2,FRAME_W,FRAME_H,
                                                             CW_ROI_X1_FRAC,CW_ROI_Y1_FRAC,
@@ -973,20 +1136,19 @@ def main():
                                                        'label':f"XWALK {conf:.2f}",
                                                        'color':(255,255,0)})
 
-                                # ── Other detections — draw but no action ─
+                                # ── Other ─────────────────────────────────
                                 else:
                                     yolo_boxes.append({'x1':x1,'y1':y1,'x2':x2,'y2':y2,
                                                        'label':f"{lbl} {conf:.2f}",
                                                        'color':(180,180,180)})
 
-                        # ── Traffic light: centre-biased selection ────────
-                        chosen = select_tl(tl_dets, FRAME_W)
+                        # ── TL: centre-biased selection ───────────────────
+                        chosen        = select_tl(tl_dets, FRAME_W)
                         tl_in_immunity = (now < tl_immunity_end)
 
                         if chosen in ('red','yellow') and not tl_in_immunity:
-                            red_active   = True;  green_active = False
+                            red_active = True;  green_active = False
                         elif chosen == 'green':
-                            # Green after red → start immunity window
                             if red_active:
                                 tl_immunity_end = now + TL_GREEN_AFTER_RED_COOLDOWN
                                 print(f"  [ML] Red→Green: TL immunity {TL_GREEN_AFTER_RED_COOLDOWN:.0f}s")
@@ -1013,28 +1175,49 @@ def main():
                                 print(f"  [ML] PEDESTRIAN detected  t={now:.1f}")
                         else:
                             if ped_active and not ped_raw:
-                                # Pedestrian left ROI — start cooldown
-                                ped_active        = False
-                                ped_cooldown_end  = now + PED_COOLDOWN_S
+                                ped_active       = False
+                                ped_cooldown_end = now + PED_COOLDOWN_S
                                 print(f"  [ML] Pedestrian cleared  cooldown {PED_COOLDOWN_S:.0f}s")
 
-                        # ── Crosswalk: direct flag (no hold needed) ───────
+                        # ── Crosswalk: direct flag ────────────────────────
                         cw_detected = cw_raw
 
                     except Exception as e:
                         print(f"  [YOLO err] {e}")
 
+                    # ── FCW: Forward Collision Warning ────────────────────
+                    if fcw_detector is not None and ENABLE_FCW and frame_raw is not None:
+                        try:
+                            fcw_res  = fcw_detector(frame_raw, verbose=False)
+                            vehicles = []
+                            for fb in fcw_res[0].boxes:
+                                cid = int(fb.cls[0].item())
+                                if float(fb.conf[0].item()) > FCW_CONFIDENCE and cid in VEHICLE_CLASSES:
+                                    fx1,fy1,fx2,fy2 = map(int, fb.xyxy[0].cpu().numpy())
+                                    vehicles.append({'class': VEHICLE_CLASSES[cid],
+                                                     'box': (fx1,fy1,fx2,fy2),
+                                                     'ratio': fy2/FRAME_H})
+                            # Add FCW boxes to persistent draw list
+                            for v in vehicles:
+                                fx1,fy1,fx2,fy2 = v['box']
+                                col = (0,0,255) if v['ratio'] > COLLISION_DIST_FRAC else (0,255,255)
+                                yolo_boxes.append({'x1':fx1,'y1':fy1,'x2':fx2,'y2':fy2,
+                                                   'label':f"FCW:{v['class']}",
+                                                   'color':col})
+                        except Exception:
+                            pass
+
                 # ── ML state machine (every frame) ────────────────────────
                 ml_brake  = False
-                ml_slow   = False   # crosswalk slow-down flag
+                ml_slow   = False
                 ml_status = "PATH CLEAR";  ml_color = (0,255,0)
 
-                # 1. Red / yellow light (highest priority, respects immunity)
+                # Priority 1: Red/yellow light
                 if red_active:
                     ml_brake  = True
                     ml_status = "RED LIGHT — STOP";  ml_color = (0,0,255)
 
-                # 2. Green light clears stop sign lock + shows immunity countdown
+                # Priority 2: Green clears stop lock
                 if green_active and stop_active:
                     stop_active = False
                     print("  [ML] Green → stop lock cleared")
@@ -1047,7 +1230,7 @@ def main():
                         ml_status = "GREEN LIGHT — GO"
                     ml_color = (0,255,0)
 
-                # 3. Stop sign hold
+                # Priority 3: Stop sign hold
                 if stop_active:
                     elapsed = now - stop_start_t
                     if elapsed < STOP_HOLD_S:
@@ -1064,21 +1247,19 @@ def main():
                         ml_status = f"STOP COOLDOWN {stop_cooldown_end-now:.1f}s"
                         ml_color  = (0,200,200)
 
-                # 4. Pedestrian hold (stop while ped in ROI, PED_STOP_HOLD_S minimum)
+                # Priority 4: Pedestrian
                 if ped_active:
-                    elapsed_ped = now - ped_start_t
-                    if elapsed_ped < PED_STOP_HOLD_S or True:  # hold while still detected
-                        ml_brake  = True
-                        ml_status = "PEDESTRIAN — STOP";  ml_color = (0,100,255)
+                    ml_brake  = True
+                    ml_status = "PEDESTRIAN — STOP";  ml_color = (0,100,255)
 
                 if not ped_active and now < ped_cooldown_end:
                     if ml_status == "PATH CLEAR":
                         ml_status = f"PED COOLDOWN {ped_cooldown_end-now:.1f}s"
                         ml_color  = (100,200,255)
 
-                # 5. Crosswalk — slow down (does NOT stop, just caps throttle)
+                # Priority 5: Crosswalk slow-down
                 if cw_detected and not ml_brake:
-                    ml_slow   = True
+                    ml_slow = True
                     if ml_status == "PATH CLEAR":
                         ml_status = "CROSSWALK — SLOW";  ml_color = (0,220,220)
 
@@ -1116,12 +1297,17 @@ def main():
                 # ══════════════════════════════════════════════════════════
                 throttle = 0.0;  delta = 0.0;  source_txt = ""
 
+                # Highest-priority stops
                 if ml_brake:
                     throttle  = THR_CRAWL
                     delta     = 0.0
                     lane_integral = 0.0
                     speed_pid.reset()
                     source_txt = ml_status
+
+                elif taxi_stop:
+                    throttle   = 0.0;  delta = 0.0
+                    source_txt = taxi_label
 
                 elif paused or stanley.completed:
                     throttle = 0.0;  delta = 0.0
@@ -1152,15 +1338,16 @@ def main():
                     delta      = STEER_ALPHA*prev_steer + (1-STEER_ALPHA)*blended
                     prev_steer = delta
 
-                    # Throttle — hierarchy: crosswalk > sharp curve > corner > normal
+                    # Throttle hierarchy
                     base_thr = speed_pid.update(v_meas, v_ref, dt)
                     is_sharp = (crad < CURVE_RADIUS_THRESHOLD) and lane_detected
-                    if   ml_slow:                    throttle = min(base_thr, CW_SLOW_THROTTLE_CAP)
-                    elif is_sharp:                   throttle = min(base_thr, 0.030)
+                    if   ml_slow:                     throttle = min(base_thr, CW_SLOW_THROTTLE_CAP)
+                    elif is_sharp:                    throttle = min(base_thr, 0.030)
                     elif corner_deg > CORNER_THRESH:  throttle = min(base_thr, 0.038)
                     else:                             throttle = base_thr
 
-                car.write(float(throttle), float(delta), np.zeros(8, dtype=int))
+                # Write to car (indicator LEDs always zeros — body strip via QVL)
+                car.write(float(throttle), float(delta), _LEDS_OFF)
 
                 # ── MAP ───────────────────────────────────────────────────
                 eu, ev = w2p(ex, ey)
@@ -1173,12 +1360,14 @@ def main():
                 if stanley.wpi < N_WP:
                     tw,tv = w2p(*WP[stanley.wpi])
                     cv2.circle(dm,(tw,tv),6,(255,100,0),-1)
-                prog = stanley.wpi/max(N_WP-1,1)
+                prog = stanley.wpi / max(N_WP-1,1)
                 cv2.rectangle(dm,(4,MAP_H-14),(int(4+prog*(MAP_W-8)),MAP_H-4),(0,180,100),-1)
 
-                status_tag = ("STOP" if ml_brake else "PAUSED" if paused else
-                              "DONE" if stanley.completed else "RUN")
-                map_color  = (0,0,255) if ml_brake else (0,255,255)
+                status_tag = ("STOP"   if ml_brake or taxi_stop else
+                              "PAUSED" if paused else
+                              "DONE"   if stanley.completed else "RUN")
+                map_color  = (0,0,255) if (ml_brake or taxi_stop) else (0,255,255)
+
                 for txt,col,pos in [
                     (f"[{status_tag}] WP:{stanley.wpi}/{N_WP} "
                      f"GPS:{'OK' if gps_fresh else 'STALE'}",
@@ -1191,6 +1380,7 @@ def main():
                      (200,255,100),(4,50)),
                     (source_txt,(255,200,0),(4,66)),
                     (f"ML: {ml_status}",ml_color,(4,82)),
+                    (taxi_label,(255,100,255),(4,98)),
                 ]:
                     cv2.putText(dm,txt,pos,cv2.FONT_HERSHEY_SIMPLEX,0.34,col,1)
                 cv2.imshow("Path Map", dm)
@@ -1199,13 +1389,11 @@ def main():
                 if ann is not None:
                     h_a, w_a = ann.shape[:2]
 
-                    # ── Draw persistent YOLO bounding boxes ───────────────
+                    # Draw persistent YOLO bounding boxes (ML + FCW)
                     for det in yolo_boxes:
                         bx1,by1,bx2,by2 = det['x1'],det['y1'],det['x2'],det['y2']
-                        bcol = det['color']
-                        blbl = det['label']
+                        bcol = det['color'];  blbl = det['label']
                         cv2.rectangle(ann, (bx1,by1), (bx2,by2), bcol, 2)
-                        # Label background pill
                         (tw,th), _ = cv2.getTextSize(blbl,
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
                         lx1,ly1 = bx1, max(by1-th-6, 0)
@@ -1214,33 +1402,39 @@ def main():
                         cv2.putText(ann, blbl, (lx1+3, ly2-3),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0,0,0), 1)
 
-                    # ── Draw ROI zones (thin coloured outlines) ───────────
-                    # Stop sign ROI (right half) — red dashed outline
+                    # FCW collision overlay
+                    fcw_danger = any(d.get('label','').startswith('FCW') and
+                                     d['color'] == (0,0,255) for d in yolo_boxes)
+                    if fcw_danger:
+                        cv2.putText(ann,"!! COLLISION WARNING !!",(w_a//2-160,h_a-60),
+                                    cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,0,255),3)
+
+                    # Draw ROI zones
                     draw_roi_outline(ann, 0.50,0.00,1.00,1.00,
                                      (0,0,200), "STOP/PED ROI")
-                    # Pedestrian ROI is identical — no double draw needed
-                    # Crosswalk ROI (bottom 25%) — yellow outline
                     draw_roi_outline(ann, CW_ROI_X1_FRAC, CW_ROI_Y1_FRAC,
                                      CW_ROI_X2_FRAC, CW_ROI_Y2_FRAC,
                                      (0,220,220), "XWALK ROI")
 
-                    # ── ML banner (top) ───────────────────────────────────
-                    cv2.rectangle(ann,(5,5),(w_a-5,75),(0,0,0),-1)
+                    # ML banner (top)
+                    cv2.rectangle(ann,(5,5),(w_a-5,78),(0,0,0),-1)
                     cv2.putText(ann, f"ML: {ml_status}",
                         (12,32), cv2.FONT_HERSHEY_SIMPLEX, 0.72, ml_color, 2)
                     cv2.putText(ann,
                         f"LANE:{lane_mode}  {cdir}  R={crad:.0f}m  "
                         f"WP:{stanley.wpi}/{N_WP}  streak:{stop_streak}",
-                        (12,62), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200,200,200), 1)
+                        (12,55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,200), 1)
+                    cv2.putText(ann, taxi_label,
+                        (12,74), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,100,255), 1)
 
-                    # ── Bottom HUD ────────────────────────────────────────
+                    # Bottom HUD
                     cv2.rectangle(ann,(0,h_a-30),(w_a,h_a),(0,0,0),-1)
                     cv2.putText(ann,
                         f"Thr:{throttle:.4f}  Steer:{math.degrees(delta):+.1f}°  "
                         f"v:{v_meas:.3f}  {source_txt}",
                         (8,h_a-8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255,220,60), 1)
 
-                    cv2.imshow("Black Hawks | Master", ann)
+                    cv2.imshow("Black Hawks | ACC Master", ann)
 
                 print(f"  [{frame_idx:05d}] "
                       f"EKF({ex:+.3f},{ey:+.3f}) "
@@ -1249,7 +1443,8 @@ def main():
                       f"L={math.degrees(lane_steer):+.0f}° "
                       f"→{math.degrees(delta):+.0f}° "
                       f"thr={throttle:.4f} "
-                      f"ML={ml_status[:12]}",
+                      f"ML={ml_status[:12]} "
+                      f"TAXI={taxi.state[:10]}",
                       end='\r')
 
                 key = cv2.waitKey(1) & 0xFF
@@ -1268,10 +1463,12 @@ def main():
             import traceback; traceback.print_exc()
 
         finally:
-            car.write(0.0, 0.0, np.zeros(8,dtype=int))
+            car.write(0.0, 0.0, _LEDS_OFF)
 
+    _qvl_close()
     cv2.destroyAllWindows()
     print(f"\n  Shutdown. frames={frame_idx}")
+
 
 if __name__ == "__main__":
     main()
